@@ -6,12 +6,16 @@ Max 1 correction loop to avoid runaway cost.
 """
 
 import json
-import anthropic
-from core.config import MODEL, MAX_TOKENS, ANTHROPIC_API_KEY, CONFIDENCE_THRESHOLD
+try:
+    import anthropic
+except ImportError:  # Local mode can run without optional LLM dependencies installed.
+    anthropic = None
+
+from core.config import MODEL, MAX_TOKENS, ANTHROPIC_API_KEY, should_use_llm
 from prompts.system_prompts import CRITIC_SYSTEM_PROMPT
 
 
-client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if anthropic and should_use_llm() else None
 
 
 def critique_report(report: dict, original_situation: str) -> dict:
@@ -19,6 +23,12 @@ def critique_report(report: dict, original_situation: str) -> dict:
     Send the synthesized report to the critic. If it passes, return as-is.
     If it fails, return the revised report with issues noted.
     """
+    if client is None:
+        report.setdefault("quality_notes", [])
+        if report.get("life_safety_flags") and not report.get("top_priorities"):
+            report["quality_notes"].append("Life-safety flags are present but no top priorities were generated.")
+        return report
+
     prompt = f"""
 Original situation report:
 {original_situation}

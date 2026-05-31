@@ -1,7 +1,7 @@
 from __future__ import annotations
 from typing import Any, List, Optional
 from pydantic import BaseModel, Field
-from datetime import datetime
+from datetime import datetime, timezone
 import uuid
 
 
@@ -24,7 +24,7 @@ class ResultMessage(BaseModel):
     confidence: str  # low | medium | high
     data: Optional[dict[str, Any]] = None
     errors: List[str] = Field(default_factory=list)
-    timestamp: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
+    timestamp: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
 class SituationReport(BaseModel):
@@ -37,4 +37,4 @@ class SituationReport(BaseModel):
     open_unknowns: List[str]
     overall_confidence: str
     life_safety_flags: List[str] = Field(default_factory=list)
-    generated_at: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
+    generated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())

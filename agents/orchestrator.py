@@ -4,15 +4,14 @@ and runs the optional critic self-correction pass.
 """
 
 import json
-import asyncio
-import anthropic
 from typing import Dict, Any
 
-from core.config import MODEL, MAX_TOKENS, ANTHROPIC_API_KEY, ENABLE_CRITIC_LOOP
+from core.config import ENABLE_CRITIC_LOOP
 from core.message_schema import TaskMessage, ResultMessage
 from core.dag_runner import run_dag
 from core.critic import critique_report
-from prompts.system_prompts import ORCHESTRATOR_SYSTEM_PROMPT
+from core.local_analysis import extract_situation, issue_catalog, utc_now
+from core.web_data import collect_web_data, web_context_block
 from agents.specialists import (
     DataAggregatorAgent,
     ResourceMapperAgent,
@@ -24,7 +23,6 @@ from agents.specialists import (
 
 class Orchestrator:
     def __init__(self):
-        self.client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
         self.data_agg = DataAggregatorAgent()
         self.resource_mapper = ResourceMapperAgent()
         self.triage = TriageAgent()
@@ -39,18 +37,20 @@ class Orchestrator:
         Main entry point. Takes a raw situation report string, runs the full
         DAG pipeline, and returns the synthesized situation report dict.
         """
+        web_data = collect_web_data(situation_report)
+        enriched_report = situation_report + web_context_block(web_data)
 
         # --- Wave 1 tasks (parallel) ---
         w1_data = self._make_task(
             "DataAggregator",
             f"Search for live data about this incident. Find weather, news, and official emergency feeds.",
-            situation_report,
+            enriched_report,
             "critical",
         )
         w1_resources = self._make_task(
             "ResourceMapper",
             "Identify available shelters, hospitals, and emergency units in the affected area.",
-            situation_report,
+            enriched_report,
             "critical",
         )
 
@@ -58,7 +58,7 @@ class Orchestrator:
         def wave2_builder(prior: Dict[str, ResultMessage]):
             data_summary = json.dumps(prior.get("DataAggregator", {}).data or {})
             resource_summary = json.dumps(prior.get("ResourceMapper", {}).data or {})
-            context = f"DataAggregator output:\n{data_summary}\n\nResourceMapper output:\n{resource_summary}\n\nOriginal report:\n{situation_report}"
+            context = f"DataAggregator output:\n{data_summary}\n\nResourceMapper output:\n{resource_summary}\n\nOriginal report:\n{enriched_report}"
             task = self._make_task(
                 "TriageAgent",
                 "Analyze all data and produce a ranked priority list of immediate needs.",
@@ -72,8 +72,8 @@ class Orchestrator:
             triage_summary = json.dumps(prior.get("TriageAgent", {}).data or {})
             resource_summary = json.dumps(prior.get("ResourceMapper", {}).data or {})
 
-            comms_context = f"Triage priorities:\n{triage_summary}\n\nOriginal report:\n{situation_report}"
-            logistics_context = f"Resources:\n{resource_summary}\n\nTriage:\n{triage_summary}\n\nOriginal report:\n{situation_report}"
+            comms_context = f"Triage priorities:\n{triage_summary}\n\nOriginal report:\n{enriched_report}"
+            logistics_context = f"Resources:\n{resource_summary}\n\nTriage:\n{triage_summary}\n\nOriginal report:\n{enriched_report}"
 
             comms_task = self._make_task(
                 "CommunicationAgent",
@@ -103,7 +103,7 @@ class Orchestrator:
         )
 
         # --- Synthesize ---
-        report = self._synthesize(situation_report, all_results)
+        report = self._synthesize(situation_report, all_results, web_data)
 
         # --- Critic pass ---
         if ENABLE_CRITIC_LOOP:
@@ -111,8 +111,14 @@ class Orchestrator:
 
         return report
 
-    def _synthesize(self, situation_report: str, results: Dict[str, ResultMessage]) -> Dict[str, Any]:
+    def _synthesize(
+        self,
+        situation_report: str,
+        results: Dict[str, ResultMessage],
+        web_data: dict[str, Any] | None = None,
+    ) -> Dict[str, Any]:
         """Merge all agent outputs into a unified situation report."""
+        situation = extract_situation(situation_report)
 
         def safe_data(agent_name: str) -> dict:
             r = results.get(agent_name)
@@ -125,6 +131,8 @@ class Orchestrator:
         comms = safe_data("CommunicationAgent")
         logistics = safe_data("LogisticsAgent")
         data_agg = safe_data("DataAggregator")
+        web_data = web_data or {}
+        issues = triage.get("issue_catalog") or data_agg.get("issue_catalog") or issue_catalog(situation_report)
 
         # Determine overall confidence
         confidences = [r.confidence for r in results.values() if r.status == "success"]
@@ -143,9 +151,29 @@ class Orchestrator:
         unknowns += data_agg.get("data_gaps", [])
         unknowns += resources.get("critical_gaps", [])
 
+        hazards = ", ".join(h for h in situation["hazards"] if h != "unknown") or "incident"
+        affected = ""
+        if situation["affected_population"]:
+            affected = f" Estimated affected population: {situation['affected_population']:,}."
+
+        issue_counts: dict[str, int] = {}
+        for issue in issues:
+            category = issue.get("category", "uncategorized")
+            issue_counts[category] = issue_counts.get(category, 0) + 1
+
         return {
-            "incident_summary": f"Incident processed from situation report. {len(results)} agents responded.",
+            "incident_summary": (
+                f"{hazards.title()} response in {situation['location']}.{affected} "
+                f"{len(results)} specialist agents produced a coordinated local action plan."
+            ),
             "top_priorities": triage.get("priorities", [])[:3],
+            "issue_catalog": issues,
+            "issue_summary": {
+                "total_active_issues": len([issue for issue in issues if issue.get("status") == "active"]),
+                "total_needs_confirmation": len([issue for issue in issues if issue.get("status") == "needs_confirmation"]),
+                "by_category": issue_counts,
+                "highest_priority_score": max([issue.get("priority_score", 0) for issue in issues], default=0),
+            },
             "resource_status": {
                 "overall": resources.get("overall_resource_status", "unknown"),
                 "resources": resources.get("resources", []),
@@ -158,6 +186,7 @@ class Orchestrator:
                 "bottlenecks": logistics.get("bottlenecks", []),
             },
             "data_confidence": data_agg.get("overall_confidence", "low"),
+            "web_data": web_data,
             "open_unknowns": unknowns,
             "overall_confidence": overall,
             "life_safety_flags": triage.get("life_safety_flags", []),
@@ -165,4 +194,5 @@ class Orchestrator:
                 name: {"status": r.status, "confidence": r.confidence}
                 for name, r in results.items()
             },
+            "generated_at": utc_now(),
         }
